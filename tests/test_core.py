@@ -133,3 +133,54 @@ def test_tar_symlink_rejected(tmp_path):
         arc.addfile(member)
     with pytest.raises(KitchenError, match='symlinks'):
         unpack(src,tmp_path/'out')
+
+
+def test_profile_template_is_never_auto_approved(firmware, tmp_path):
+    from portkitchen.core import create_profile_template
+    donor, target, _ = firmware
+    result = create_profile_template(donor, target, tmp_path / 'review')
+    profile = json.loads((tmp_path / 'review/profile-template.json').read_text())
+    assert profile['compatibility_confirmed'] is False
+    assert profile['donor_model'] == 'SM-D100'
+    assert profile['target_model'] == 'SM-T100'
+    assert profile['donor_partitions'] == ['system', 'product']
+    assert result['flashable'] is False
+    assert result['target_partitions']['vendor'] == len(b'target-vendor')
+    assert (tmp_path/'review/review.json').exists()
+
+
+def test_profile_template_refuses_existing_output(firmware, tmp_path):
+    from portkitchen.core import create_profile_template
+    donor, target, _ = firmware
+    (tmp_path/'review').mkdir()
+    (tmp_path/'review/previous.txt').write_text('existing')
+    with pytest.raises(KitchenError, match='empty'):
+        create_profile_template(donor, target, tmp_path / 'review')
+
+
+def test_profile_command(firmware, tmp_path):
+    from portkitchen.__main__ import main
+    donor, target, _ = firmware
+    assert main(['profile', '--donor', str(donor), '--target', str(target), '--output', str(tmp_path / 'review')]) == 0
+    assert (tmp_path/'review/profile-template.json').exists()
+
+
+def test_copy_is_bounded(tmp_path):
+    from portkitchen.core import _copy_limited
+    with pytest.raises(KitchenError, match='too large'):
+        _copy_limited(io.BytesIO(b'abcdef'), tmp_path/'overflow', 5)
+
+
+def test_rejects_invalid_manifest_type(tmp_path):
+    src = tmp_path / 'bad.zip'
+    with zipfile.ZipFile(src, 'w') as arc:
+        arc.writestr('system.img', b'images')
+        arc.writestr('firmware.json', '[]')
+    with pytest.raises(KitchenError, match='JSON object'):
+        unpack(src, tmp_path / 'unpack')
+
+def test_rejects_invalid_profile_type(firmware, tmp_path):
+    donor, target, profile = firmware
+    profile.write_text('[]')
+    with pytest.raises(KitchenError, match='JSON object'):
+        create_build(donor, target, profile, tmp_path / 'out')

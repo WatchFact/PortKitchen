@@ -23,7 +23,7 @@ jobs:
       - run: python -m pytest -q
       - run: python -m build
   release:
-    name: Source-code GitHub release
+    name: Publish source release after tests
     needs: test
     if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
@@ -35,18 +35,23 @@ jobs:
         with:
           python-version: '3.12'
       - run: python -m pip install --upgrade build
-      - name: Package the application
+      - name: Package the application and source
         run: |
           python -m build
-          git archive --format=zip --output=dist/PortKitchen-source-v0.1.0.zip HEAD
-      - name: Create release (source only, never firmware)
+          VERSION=$(python -c 'from portkitchen import __version__; print(__version__)')
+          git archive --format=zip --output="dist/PortKitchen-source-v${VERSION}.zip" HEAD
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+      - name: Publish GitHub release (application source only)
         env:
           GH_TOKEN: ${{ github.token }}
-          SHA: ${{ github.sha }}
           GH_REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
         run: |
-          if gh release view v0.1.0 >/dev/null 2>&1; then
-            echo 'v0.1.0 already released; skipping duplicate.'
+          TAG="v${VERSION}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "${TAG} was already released; no asset replacement or tag rewrite"
           else
-            gh release create v0.1.0 dist/* --target "$SHA" --title 'PortKitchen v0.1.0 – Developer Preview' --prerelease --notes 'Initial One UI donor/target image extraction, validation, image staging, optional super image assembly and GitHub Actions workflow. NOT a flash-ready ROM. Hardware-specific porting is still required.'
+            gh release create "$TAG" dist/* --target "$SHA" \
+              --title "PortKitchen ${TAG} – Developer Preview" --prerelease \
+              --notes 'One UI donor/target review and firmware staging with GitHub Actions. Includes unapproved profile generator and audited target-super layout exports. NOT a flash-ready ROM.'
           fi
