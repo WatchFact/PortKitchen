@@ -1,0 +1,109 @@
+name: Prepare One UI Port
+on:
+  workflow_dispatch:
+    inputs:
+      donor_url:
+        description: 'Direct HTTPS URL to donor firmware ZIP / AP TAR.MD5'
+        required: true
+        type: string
+      target_url:
+        description: 'Direct HTTPS URL to target stock firmware ZIP / AP TAR.MD5'
+        required: true
+        type: string
+      profile_url:
+        description: 'HTTPS URL to reviewed device-profile JSON'
+        required: true
+        type: string
+      donor_sha256:
+        description: 'Optional SHA-256 of donor firmware'
+        required: false
+        type: string
+      target_sha256:
+        description: 'Optional SHA-256 of target firmware'
+        required: false
+        type: string
+      assemble_super:
+        description: 'Assemble super.img using explicit profile layout'
+        type: boolean
+        default: false
+      artifact_days:
+        description: 'Artifact retention days (1–7)'
+        type: choice
+        options: ['1', '3', '7']
+        default: '1'
+permissions:
+  contents: read
+jobs:
+  port:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/hostedtoolcache/CodeQL /usr/local/share/powershell || true
+          df -h .
+      - name: Install firmware dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq lz4 android-sdk-libsparse-utils git
+          git init -q /tmp/aosp-partition-tools
+          git -C /tmp/aosp-partition-tools remote add origin https://github.com/Rprop/aosp15_partition_tools.git
+          git -C /tmp/aosp-partition-tools fetch -q --depth=1 origin 5e92a5d504de33414318ced8bad5507440bb8c30
+          git -C /tmp/aosp-partition-tools checkout -q FETCH_HEAD
+          mkdir -p "$HOME/.local/bin"
+          cp /tmp/aosp-partition-tools/linux_glibc_x86_64/{lpmake,lpunpack,lpdumps,simg2img} "$HOME/.local/bin/"
+          chmod +x "$HOME/.local/bin/"{lpmake,lpunpack,lpdumps,simg2img}
+          ln -s lpdumps "$HOME/.local/bin/lpdump"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Fetch archives with optional SHA-256 verification
+        env:
+          DONOR_URL: ${{ inputs.donor_url }}
+          TARGET_URL: ${{ inputs.target_url }}
+          PROFILE_URL: ${{ inputs.profile_url }}
+          DONOR_SHA: ${{ inputs.donor_sha256 }}
+          TARGET_SHA: ${{ inputs.target_sha256 }}
+        run: |
+          mkdir -p work
+          python - <<'PY'
+          import hashlib, os, subprocess, urllib.parse
+          for name in ('donor','target','profile'):
+              url = os.environ[name.upper()+'_URL']
+              parsed = urllib.parse.urlsplit(url)
+              if parsed.scheme != 'https' or not parsed.hostname or parsed.username or parsed.password:
+                  raise SystemExit(name + ': only standard HTTPS URLs are allowed')
+              output = 'work/' + name + ('.json' if name == 'profile' else '.fw')
+              print('Downloading', name)
+              subprocess.run(['curl','--fail','--silent','--show-error','--location','--retry','3','--proto','=https','--proto-redir','=https','--connect-timeout','30','--output',output,url], check=True)
+              expected = os.environ.get(name.upper()+'_SHA','').strip().lower()
+              if expected:
+                  if len(expected) != 64 or any(c not in '0123456789abcdef' for c in expected):
+                      raise SystemExit(name + ': invalid SHA-256 digest')
+                  h=hashlib.sha256()
+                  with open(output,'rb') as f:
+                      for chunk in iter(lambda:f.read(4*1024*1024), b''):
+                          h.update(chunk)
+                  if h.hexdigest() != expected:
+                      raise SystemExit(name + ': SHA-256 mismatch, build stopped')
+          PY
+          df -h .
+      - name: Stage firmware port
+        env:
+          ASSEMBLE: ${{ inputs.assemble_super }}
+        run: |
+          if [[ "$ASSEMBLE" == true ]]; then
+            python -m portkitchen build --donor work/donor.fw --target work/target.fw --profile work/profile.json --output output --assemble-super
+          else
+            python -m portkitchen build --donor work/donor.fw --target work/target.fw --profile work/profile.json --output output
+          fi
+      - name: Upload staged images and manifest (not a flash-ready ROM)
+        uses: actions/upload-artifact@v4
+        with:
+          name: PortKitchen-${{ github.run_number }}
+          path: output/
+          retention-days: ${{ fromJSON(inputs.artifact_days) }}
+          compression-level: 0
+          if-no-files-found: error

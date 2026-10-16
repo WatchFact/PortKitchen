@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+.venv/
+*.img
+*.img.lz4
+*.tar.md5
+*.zip
+*.part
+output/

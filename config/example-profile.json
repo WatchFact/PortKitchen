@@ -1,0 +1,6 @@
+{
+  "donor_model": "REPLACE_WITH_DONOR_MODEL",
+  "target_model": "REPLACE_WITH_TARGET_MODEL",
+  "compatibility_confirmed": false,
+  "donor_partitions": ["system", "system_ext", "product"]
+}
