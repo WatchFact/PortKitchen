@@ -5,7 +5,7 @@ import sys
 from pathlib import Path
 
 from . import __version__
-from .core import KitchenError, create_build, hash_file, unpack
+from .core import KitchenError, create_build, create_profile_template, hash_file, unpack
 
 
 def main(argv=None) -> int:
@@ -15,6 +15,9 @@ def main(argv=None) -> int:
     inspect = commands.add_parser('inspect', help='Unpack firmware and list its partitions')
     inspect.add_argument('--firmware', required=True, type=Path)
     inspect.add_argument('--output', required=True, type=Path)
+    profile = commands.add_parser('profile', help='Inspect donor/target and make an unapproved compatibility profile template')
+    for key in ('donor', 'target', 'output'):
+        profile.add_argument('--' + key, required=True, type=Path)
     build = commands.add_parser('build', help='Stage donor framework over target hardware partitions')
     for key in ('donor', 'target', 'profile', 'output'):
         build.add_argument('--' + key, required=True, type=Path)
@@ -25,6 +28,8 @@ def main(argv=None) -> int:
             images, meta = unpack(args.firmware, args.output)
             payload = {'metadata': meta, 'partitions': {key: {'size': image.stat().st_size, 'sha256': hash_file(image)} for key, image in sorted(images.items())}}
             (args.output / 'inspection.json').write_text(json.dumps(payload, indent=2) + '\n')
+        elif args.command == 'profile':
+            payload = create_profile_template(args.donor, args.target, args.output)
         else:
             payload = create_build(args.donor, args.target, args.profile, args.output, args.assemble_super)
         print(json.dumps(payload, indent=2))

@@ -16,7 +16,9 @@ import tempfile
 import zipfile
 from pathlib import Path
 
-PARTITION_RE = re.compile(r"^(system|system_ext|product|vendor|vendor_dlkm|odm|odm_dlkm|system_dlkm|system_dlkm|vendor_boot|init_boot|boot|dtbo|vbmeta|vbmeta_system|recovery|super)(?:_([ab]))?\.img(?:\.lz4)?$", re.I)
+from . import __version__
+
+PARTITION_RE = re.compile(r"^(system|system_ext|product|vendor|vendor_dlkm|odm|odm_dlkm|system_dlkm|vendor_boot|init_boot|boot|dtbo|vbmeta|vbmeta_system|recovery|super)(?:_([ab]))?\.img(?:\.lz4)?$", re.I)
 DEFAULT_DONOR = ("system", "system_ext", "product")
 MAX_ARCHIVE_MEMBERS = 20000
 MAX_ENTRY_BYTES = 16 * 1024**3
@@ -157,12 +159,27 @@ def _place_file(path: Path, out: Path, depth: int, budget: list[int], already_co
         if name.endswith('.lz4'):
             if dest.with_suffix('').exists():
                 raise KitchenError(f'Duplicate partition image: {dest.with_suffix("").name}')
-            with dest.with_suffix('').open('wb') as handle:
-                proc = subprocess.run([tool('lz4'), '-d', '-c', str(path)], stdout=handle, stderr=subprocess.PIPE)
-            dest = dest.with_suffix('')
-            if proc.returncode:
-                dest.unlink(missing_ok=True)
-                raise KitchenError('LZ4 decompression failed: ' + proc.stderr.decode(errors='replace')[-500:])
+            decompressed = dest.with_suffix('')
+            # Limit expanded data as well as compressed archive entries. This protects
+            # Actions runners from accidentally decompressing unbounded LZ4 streams.
+            maximum = min(MAX_ENTRY_BYTES, budget[0])
+            proc = subprocess.Popen([tool('lz4'), '-d', '-c', str(path)],
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            try:
+                assert proc.stdout is not None
+                _copy_limited(proc.stdout, decompressed, maximum)
+                proc.stdout.close()
+                errors = proc.stderr.read() if proc.stderr else b''
+                rc = proc.wait()
+                if rc:
+                    raise KitchenError('LZ4 decompression failed: ' + errors.decode(errors='replace')[-500:])
+                budget[0] -= decompressed.stat().st_size
+            except BaseException:
+                proc.kill() if proc.poll() is None else None
+                proc.wait()
+                decompressed.unlink(missing_ok=True)
+                raise
+            dest = decompressed
         else:
             shutil.copyfile(path, dest)
         # Android sparse magic is 0xed26ff3a (little endian).
@@ -182,12 +199,22 @@ def unpack(source: Path, destination: Path) -> tuple[dict[str, Path], dict]:
     if (destination / 'firmware.json').exists():
         try:
             metadata = json.loads((destination / 'firmware.json').read_text())
+            if not isinstance(metadata, dict):
+                raise KitchenError('firmware.json must contain a JSON object')
         except (ValueError, UnicodeError) as exc:
             raise KitchenError('Invalid firmware.json in firmware source') from exc
     super_img = destination / 'super.img'
     if super_img.exists():
         extracted = destination / 'logical'
         extracted.mkdir(exist_ok=True)
+        # Preserve the stock logical layout for auditing. Some AOSP builds do
+        # not support --json; the plain-text form is then retained instead.
+        dumper = shutil.which('lpdump')
+        if dumper:
+            for flags, filename in ((['--json'], 'stock-super-metadata.json'), ([], 'stock-super-metadata.txt')):
+                dump = subprocess.run([dumper, *flags, str(super_img)], capture_output=True, text=True)
+                if dump.returncode == 0 and dump.stdout.strip():
+                    (destination / filename).write_text(dump.stdout)
         run(tool('lpunpack'), super_img, extracted)
         for item in extracted.glob('*.img'):
             if (destination / item.name).exists():
@@ -298,6 +325,8 @@ def super_arguments(images: dict[str, Path], layout: dict, output: Path) -> list
 
 def create_build(donor: Path, target: Path, profile: Path, output: Path, assemble_super: bool = False) -> dict:
     profile_data = json.loads(profile.read_text())
+    if not isinstance(profile_data, dict):
+        raise KitchenError('Device profile must contain a JSON object')
     output.mkdir(parents=True, exist_ok=True)
     if any(output.iterdir()):
         raise KitchenError('Output directory must be empty to avoid stale artifacts')
@@ -309,7 +338,7 @@ def create_build(donor: Path, target: Path, profile: Path, output: Path, assembl
         selected = selection(donor_images, target_images, profile_data)
         stage = output / 'images'
         stage.mkdir()
-        manifest = {'project': 'PortKitchen', 'version': '0.1.0', 'flashable': False,
+        manifest = {'project': 'PortKitchen', 'version': __version__, 'flashable': False,
                     'target_model': profile_data['target_model'], 'donor_model': profile_data['donor_model'],
                     'donor_sha256': hash_file(donor) if donor.is_file() else None,
                     'target_sha256': hash_file(target) if target.is_file() else None,
@@ -338,3 +367,60 @@ def create_build(donor: Path, target: Path, profile: Path, output: Path, assembl
             'fstab, file_contexts, SELinux, AVB, partitions, dynamic groups and recovery.\n'
             'Do not flash automatically. Back up all partitions and user data.\n')
         return manifest
+
+
+def create_profile_template(donor: Path, target: Path, output: Path) -> dict:
+    """Inspect both firmware archives and create an explicitly unapproved recipe.
+
+    This command deliberately does *not* claim that donor and target are compatible.
+    Unlike a build, it does not stage multi-gigabyte images as artifacts.
+    """
+    if output.exists() and any(output.iterdir()):
+        raise KitchenError('Output directory must be empty to avoid stale artifacts')
+    output.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix='portkitchen-review-') as temp:
+        root = Path(temp)
+        di, dm = unpack(donor, root / 'donor')
+        ti, tm = unpack(target, root / 'target')
+        ds = _slot(di)
+        ts = _slot(ti)
+        matched = [part for part in DEFAULT_DONOR if part + ds in di and part + ts in ti]
+        profile = {
+            'donor_model': dm.get('model', 'REVIEW_DONOR_MODEL'),
+            'target_model': tm.get('model', 'REVIEW_TARGET_MODEL'),
+            'compatibility_confirmed': False,
+            'donor_partitions': matched or ['system'],
+        }
+        report = {
+            'flashable': False,
+            'donor_source_sha256': hash_file(donor) if donor.is_file() else None,
+            'target_source_sha256': hash_file(target) if target.is_file() else None,
+            'donor_metadata': dm,
+            'target_metadata': tm,
+            'donor_partitions': {key: image.stat().st_size for key, image in sorted(di.items())},
+            'target_partitions': {key: image.stat().st_size for key, image in sorted(ti.items())},
+            'donor_slot': ds or 'unsuffixed',
+            'target_slot': ts or 'unsuffixed',
+            'missing_in_donor': sorted(set(ti) - set(di)),
+            'missing_in_target': sorted(set(di) - set(ti)),
+            'needs_manual_review': [
+                'Confirm architecture, Android API level and framework/vendor compatibility.',
+                'Confirm the donor and target models: standard Samsung archives may not contain model metadata.',
+                'Review stock dynamic partition geometry and available capacity.',
+                'Plan device-specific RIL, camera, SELinux, fstab, VINTF, encryption and AVB adaptations.',
+                'Never change compatibility_confirmed without a full compatibility review.',
+            ],
+        }
+        for side in ('donor', 'target'):
+            for ext in ('json','txt'):
+                orig = root / side / ('stock-super-metadata.' + ext)
+                if orig.is_file():
+                    shutil.copyfile(orig, output / (side + '-super-metadata.' + ext))
+    (output / 'profile-template.json').write_text(json.dumps(profile, indent=2) + '\n')
+    (output / 'review.json').write_text(json.dumps(report, indent=2) + '\n')
+    (output / 'READ_ME_FIRST.txt').write_text(
+        'This is a review TEMPLATE, not a compatible or flash-ready ROM.\n'
+        'Complete device research before approving compatibility.\n'
+        'Stock super metadata is included when the lpdump tool is available.\n'
+    )
+    return report
