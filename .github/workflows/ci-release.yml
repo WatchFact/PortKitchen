@@ -38,8 +38,7 @@ jobs:
       - name: Package the application
         run: |
           python -m build
-          (cd .. && zip -q -r PortKitchen-source-v0.1.0.zip portkitchen -x '*.git*' '*__pycache__*' '*.egg-info*' '*pytest_cache*' '*/dist/*')
-          mv ../PortKitchen-source-v0.1.0.zip dist/
+          git archive --format=zip --output=dist/PortKitchen-source-v0.1.0.zip HEAD
       - name: Create release (source only, never firmware)
         env:
           GH_TOKEN: ${{ github.token }}
